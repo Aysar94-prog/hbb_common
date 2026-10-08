@@ -89,6 +89,21 @@ message LanLoginRequest {
   string access_username = 1;
   bytes access_password = 2;
   uint64 credential_revision_hint = 3;
+  // 0 preserves password login with older LAN v1 peers. Optional methods
+  // require capabilities received over the verified encrypted stream.
+  uint32 access_method = 4;
+  string temporary_code = 5;
+}
+
+message LanAccessProbe { uint32 version = 1; }
+message LanAccessCapabilities {
+  uint32 version = 1;
+  bool code_enabled = 2;
+  bool manual_enabled = 3;
+}
+message LanAccessPending {
+  uint32 version = 1;
+  uint32 timeout_seconds = 2;
 }
 
 message LoginRequest {
@@ -1012,5 +1027,8 @@ message Message {
     TerminalResponse terminal_response = 32;
     LanClientHello lan_client_hello = 33;
     LanServerHello lan_server_hello = 34;
+    LanAccessProbe lan_access_probe = 35;
+    LanAccessCapabilities lan_access_capabilities = 36;
+    LanAccessPending lan_access_pending = 37;
   }
 }

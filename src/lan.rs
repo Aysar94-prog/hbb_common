@@ -5,6 +5,10 @@ use sha2::{Digest, Sha256};
 
 pub const DEFAULT_PORT: u16 = 21_118;
 pub const PROTOCOL_VERSION: u32 = 1;
+pub const ACCESS_VERSION: u32 = 1;
+pub const ACCESS_PASSWORD: u32 = 0;
+pub const ACCESS_CODE: u32 = 1;
+pub const ACCESS_MANUAL: u32 = 2;
 pub const NONCE_LEN: usize = 32;
 pub const MAX_ENDPOINT_LEN: usize = 512;
 pub const MAX_HOST_LEN: usize = 253;
