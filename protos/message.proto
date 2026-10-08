@@ -124,6 +124,9 @@ message Auth2FA {
 
 message ChatMessage { string text = 1; }
 
+// Optional, authenticated session attention event. Never encoded as chat text.
+message ChatAttention { uint32 version = 1; }
+
 message Features {
   bool privacy_mode = 1;
   bool terminal = 2;
@@ -884,6 +887,7 @@ message Misc {
     DisplayResolution change_display_resolution = 36;
     MessageQuery message_query = 37;
     int32 follow_current_display = 38;
+    ChatAttention chat_attention = 39;
   }
 }
 
