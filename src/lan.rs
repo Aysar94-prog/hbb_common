@@ -9,6 +9,8 @@ pub const ACCESS_VERSION: u32 = 1;
 pub const ACCESS_PASSWORD: u32 = 0;
 pub const ACCESS_CODE: u32 = 1;
 pub const ACCESS_MANUAL: u32 = 2;
+/// Requires a positive encrypted capability reply; never sent to legacy peers.
+pub const ACCESS_PASSWORD_ONLY: u32 = 3;
 pub const NONCE_LEN: usize = 32;
 pub const MAX_ENDPOINT_LEN: usize = 512;
 pub const MAX_HOST_LEN: usize = 253;
@@ -155,6 +157,11 @@ pub fn validate_username(value: &str) -> Result<String> {
         bail!("Access username contains control characters");
     }
     Ok(value.to_owned())
+}
+
+/// Empty means password-only; nonempty remains a validated legacy account.
+pub fn validate_credential_username(value: &str) -> Result<String> {
+    if value.is_empty() { Ok(String::new()) } else { validate_username(value) }
 }
 
 pub fn validate_password(password: &[u8]) -> Result<()> {

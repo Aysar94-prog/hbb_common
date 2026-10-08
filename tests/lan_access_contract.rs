@@ -48,6 +48,20 @@ async fn encrypted_pair() -> (Stream, Stream) {
     (client, server)
 }
 
+#[test]
+fn password_only_is_additive_and_old_capabilities_never_opt_in() {
+    let old = LanAccessCapabilities::parse_from_bytes(&[8, 1, 16, 1, 24, 1]).unwrap();
+    assert!(!old.password_only_enabled);
+    let caps = LanAccessCapabilities { version: ACCESS_VERSION, password_only_enabled: true, ..Default::default() };
+    assert!(LanAccessCapabilities::parse_from_bytes(&caps.write_to_bytes().unwrap()).unwrap().password_only_enabled);
+    let login = LanLoginRequest { access_method: ACCESS_PASSWORD_ONLY, access_password: Bytes::from_static(b"synthetic"), ..Default::default() };
+    let parsed = LanLoginRequest::parse_from_bytes(&login.write_to_bytes().unwrap()).unwrap();
+    assert_eq!(parsed.access_method, 3);
+    assert!(parsed.access_username.is_empty());
+    assert!(parsed.temporary_code.is_empty());
+    assert_eq!(parsed.access_password.as_ref(), b"synthetic");
+}
+
 #[tokio::test]
 async fn probe_capabilities_request_and_pending_cross_encrypted_stream() {
     let (mut client, mut server) = encrypted_pair().await;

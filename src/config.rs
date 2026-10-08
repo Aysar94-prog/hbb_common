@@ -607,6 +607,19 @@ impl Config2 {
         Config::store_(&config, "2");
     }
 
+    fn store_checked(&self) -> Result<()> {
+        // Preserve the existing encryption transformations, including the unlock PIN.
+        let mut config = self.clone();
+        let stored = Config::load_::<Config2>("2");
+        if let Some(mut socks) = config.socks {
+            let previous = stored.socks.as_ref().map(|s| s.password.as_str()).unwrap_or_default();
+            socks.password = keep_encrypted_storage_if_plaintext_unchanged(&socks.password, previous);
+            config.socks = Some(socks);
+        }
+        config.unlock_pin = keep_encrypted_storage_if_plaintext_unchanged(&config.unlock_pin, &stored.unlock_pin);
+        store_path(Self::file(), &config)
+    }
+
     pub fn get() -> Config2 {
         return CONFIG2.read().unwrap().clone();
     }
@@ -788,6 +801,18 @@ impl Config {
         config.id.clear();
         config.enc_id.clear();
         Config::store_(&config, "");
+    }
+
+    fn store_checked(&self) -> Result<()> {
+        let mut config = self.clone();
+        Self::prepare_config_for_store(&mut config);
+        if !config.password.is_empty() && decode_permanent_password_h1_from_storage(&config.password).is_none() {
+            let stored = Config::load_::<Config>("");
+            config.password = keep_encrypted_storage_if_plaintext_unchanged(&config.password, &stored.password);
+        }
+        config.id.clear();
+        config.enc_id.clear();
+        store_path(Self::file(), &config)
     }
 
     pub fn file() -> PathBuf {
@@ -1039,7 +1064,47 @@ impl Config {
 
     pub fn lan_credentials_configured() -> bool {
         let config = CONFIG.read().unwrap();
-        !config.access_username.is_empty() && !config.access_password_hash.is_empty()
+        !config.access_password_hash.is_empty()
+    }
+
+    pub fn lan_password_access_enabled() -> bool {
+        Self::lan_credentials_configured() && Self::get_option("lan-password-access-disabled") != "Y"
+    }
+
+    /// Preserve an existing legacy account for explicit old-peer compatibility.
+    /// New password-only receivers need no account name and never invent one.
+    pub fn set_lan_password(password: &[u8]) -> Result<u64> {
+        let password_hash = hash_lan_password(password)?;
+        let mut config = CONFIG.write().unwrap();
+        let mut updated = config.clone();
+        updated.access_password_hash = password_hash;
+        updated.credential_revision = updated.credential_revision.saturating_add(1).max(1);
+        updated.lan_schema_version = LAN_SCHEMA_VERSION;
+        let revision = updated.credential_revision;
+        updated.store_checked()?;
+        *config = updated;
+        Ok(revision)
+    }
+
+    pub fn set_lan_password_access_enabled(enabled: bool) -> Result<()> {
+        let mut config = CONFIG2.write().unwrap();
+        let mut updated = config.clone();
+        updated.options.insert("lan-password-access-disabled".to_owned(), if enabled { "N" } else { "Y" }.to_owned());
+        updated.store_checked()?;
+        *config = updated;
+        Ok(())
+    }
+
+    pub fn verify_lan_password(password: &[u8]) -> Result<bool> {
+        let enabled = Self::lan_password_access_enabled();
+        let hash = CONFIG.read().unwrap().access_password_hash.clone();
+        Self::verify_lan_password_against(&hash, password, enabled)
+    }
+
+    fn verify_lan_password_against(hash: &str, password: &[u8], enabled: bool) -> Result<bool> {
+        crate::lan::validate_password(password)?;
+        if !enabled || hash.is_empty() { return Ok(false); }
+        verify_lan_password_hash(hash, password)
     }
 
     pub fn get_lan_access_username() -> String {
@@ -1125,6 +1190,7 @@ impl Config {
     }
 
     pub fn verify_lan_credentials(username: &str, password: &[u8]) -> Result<bool> {
+        if !Self::lan_password_access_enabled() { return Ok(false); }
         let (stored_username, stored_password_hash) = {
             let config = CONFIG.read().unwrap();
             (
@@ -3417,6 +3483,22 @@ mod tests {
     use super::{permanent_password::PERMANENT_PASSWORD_ENC_VERSION, *};
 
     static CONFIG_STATE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn password_only_requires_actual_hash_and_enabled_method_not_an_account() {
+        let hash = hash_lan_password(b"synthetic-test-password").unwrap();
+        assert!(Config::verify_lan_password_against(&hash, b"synthetic-test-password", true).unwrap());
+        assert!(!Config::verify_lan_password_against(&hash, b"wrong", true).unwrap());
+        assert!(!Config::verify_lan_password_against(&hash, b"synthetic-test-password", false).unwrap());
+        assert!(!Config::verify_lan_password_against("", b"synthetic-test-password", true).unwrap());
+        assert!(Config::verify_lan_password_against(&hash, b"", true).is_err());
+        assert!(Config::verify_lan_password_against(&hash, b"bad\npassword", true).is_err());
+        let mut legacy = Config { access_username: "legacy-account".into(), access_password_hash: hash,
+            ..Default::default() };
+        legacy.sanitize_lan_only();
+        assert!(Config::verify_lan_password_against(&legacy.access_password_hash, b"synthetic-test-password", true).unwrap());
+        assert_eq!(legacy.access_username, "legacy-account");
+    }
 
     #[test]
     fn lan_only_sanitizer_removes_legacy_identity_and_authentication() {
