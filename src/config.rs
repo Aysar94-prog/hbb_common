@@ -561,6 +561,27 @@ fn patch(path: PathBuf) -> PathBuf {
 }
 
 impl Config2 {
+    fn lan_manual_approval_enabled(&self) -> Result<bool> {
+        match self.options.get("lan-manual-approval-disabled").map(String::as_str) {
+            None | Some("N") => Ok(true),
+            Some("Y") => Ok(false),
+            _ => Err(anyhow!("Invalid saved manual approval preference")),
+        }
+    }
+
+    fn update_lan_manual_approval(
+        &mut self,
+        enabled: bool,
+        store: impl FnOnce(&Self) -> Result<()>,
+    ) -> Result<()> {
+        let mut updated = self.clone();
+        updated.options.insert("lan-manual-approval-disabled".to_owned(),
+            if enabled { "N" } else { "Y" }.to_owned());
+        store(&updated)?;
+        *self = updated;
+        Ok(())
+    }
+
     fn load() -> Config2 {
         let mut config = Config::load_::<Config2>("2");
         let mut store = config.sanitize_lan_only();
@@ -1093,6 +1114,15 @@ impl Config {
         updated.store_checked()?;
         *config = updated;
         Ok(())
+    }
+
+    pub fn lan_manual_approval_enabled() -> Result<bool> {
+        CONFIG2.read().unwrap().lan_manual_approval_enabled()
+    }
+
+    /// Only this preference persists; pending nonces/acceptance remain volatile.
+    pub fn set_lan_manual_approval_enabled(enabled: bool) -> Result<()> {
+        CONFIG2.write().unwrap().update_lan_manual_approval(enabled, Config2::store_checked)
     }
 
     pub fn verify_lan_password(password: &[u8]) -> Result<bool> {
@@ -3483,6 +3513,50 @@ mod tests {
     use super::{permanent_password::PERMANENT_PASSWORD_ENC_VERSION, *};
 
     static CONFIG_STATE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn manual_approval_defaults_on_and_invalid_preferences_fail_closed() {
+        let mut config = Config2::default();
+        assert_eq!(config.lan_manual_approval_enabled().unwrap(), true);
+        for (value, enabled) in [("Y", false), ("N", true)] {
+            config.options.insert("lan-manual-approval-disabled".into(), value.into());
+            assert_eq!(config.lan_manual_approval_enabled().unwrap(), enabled);
+        }
+        for value in ["", "true", "unknown"] {
+            config.options.insert("lan-manual-approval-disabled".into(), value.into());
+            assert!(config.lan_manual_approval_enabled().is_err());
+        }
+    }
+
+    #[test]
+    fn manual_approval_failed_write_preserves_saved_choice_and_other_config() {
+        let mut config = Config2 { unlock_pin: "synthetic-pin-marker".into(),
+            options: HashMap::from([("view_style".into(), "original".into())]), ..Default::default() };
+        let original = config.clone();
+        assert!(config.update_lan_manual_approval(false, |updated| {
+            assert!(!updated.lan_manual_approval_enabled().unwrap());
+            assert_eq!(updated.unlock_pin, original.unlock_pin);
+            assert_eq!(updated.options.get("view_style"), original.options.get("view_style"));
+            Err(anyhow!("Synthetic write failure"))
+        }).is_err());
+        assert_eq!(config, original);
+    }
+
+    #[test]
+    fn manual_approval_saved_on_off_round_trip_preserves_unrelated_options() {
+        let path = std::env::temp_dir().join(format!("subnetdesk-manual-preference-{}-{}.toml",
+            std::process::id(), crate::get_time()));
+        let mut config = Config2 { options: HashMap::from([("view_style".into(), "original".into())]),
+            ..Default::default() };
+        for enabled in [false, true, false] {
+            config.update_lan_manual_approval(enabled, |updated| store_path(path.clone(), updated)).unwrap();
+            let restored: Config2 = confy::load_path(&path).unwrap();
+            assert_eq!(restored.lan_manual_approval_enabled().unwrap(), enabled);
+            assert_eq!(restored.options.get("view_style").unwrap(), "original");
+            assert_eq!(restored.options.len(), 2);
+        }
+        fs::remove_file(path).unwrap();
+    }
 
     #[test]
     fn password_only_requires_actual_hash_and_enabled_method_not_an_account() {
