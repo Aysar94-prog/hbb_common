@@ -700,6 +700,55 @@ pub fn store_path<T: serde::Serialize>(path: PathBuf, cfg: T) -> crate::ResultTy
     }
 }
 
+/// A cross-process advisory lock implemented as an exclusively-created
+/// sentinel file next to the protected config. `create_new` is atomic at the
+/// filesystem level on every platform this project targets, so this is
+/// sufficient to serialize a checked read-modify-write cycle across separate
+/// OS processes (e.g. the Flutter UI process and a tray-launched connection
+/// process) without adding a platform-specific file-locking dependency.
+struct CrossProcessLock {
+    path: PathBuf,
+}
+
+impl CrossProcessLock {
+    fn acquire(path: PathBuf, timeout: Duration) -> crate::ResultType<Self> {
+        let start = Instant::now();
+        loop {
+            match fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(_) => return Ok(Self { path }),
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                    if let Ok(metadata) = fs::metadata(&path) {
+                        if let Ok(modified) = metadata.modified() {
+                            if let Ok(age) = SystemTime::now().duration_since(modified) {
+                                if age > Duration::from_secs(5) {
+                                    // The prior holder crashed without releasing the lock; break it.
+                                    let _ = fs::remove_file(&path);
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                    if start.elapsed() > timeout {
+                        return Err(anyhow!("Timed out waiting for the LocalConfig lock"));
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(err) => return Err(err.into()),
+            }
+        }
+    }
+}
+
+impl Drop for CrossProcessLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
 impl Config {
     fn load_<T: serde::Serialize + serde::de::DeserializeOwned + Default + std::fmt::Debug>(
         suffix: &str,
@@ -2120,6 +2169,36 @@ pub struct LanIdentity {
     pub updated_at: i64,
 }
 
+/// The key under which the legacy Flutter group JSON blob
+/// (`{"version":1,"groups":[...],"peer_groups":{...}}`) is stored in
+/// `LocalConfig::ui_flutter`. Kept in sync with canonical `favorites`/
+/// `favorite_groups` in both directions until the Flutter UI is migrated to
+/// dedicated canonical bridge calls (plan phase 4).
+const FAVORITE_PEER_GROUPS_OPTION_KEY: &str = "favorite-peer-groups";
+
+/// A canonical, fingerprint-keyed saved LAN device. `fingerprint` is the
+/// device's verified identity and is empty only for a legacy favorite that
+/// migration could not unambiguously match to a single verified recent
+/// connection; such an entry remains manageable by its last-known `endpoint`
+/// until the user edits or removes it.
+#[derive(Debug, Default, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct FavoriteDevice {
+    #[serde(default, deserialize_with = "deserialize_string")]
+    pub fingerprint: String,
+    #[serde(default, deserialize_with = "deserialize_string")]
+    pub endpoint: String,
+    #[serde(default, deserialize_with = "deserialize_string")]
+    pub group_id: String,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct FavoriteGroup {
+    #[serde(default, deserialize_with = "deserialize_string")]
+    pub id: String,
+    #[serde(default, deserialize_with = "deserialize_string")]
+    pub name: String,
+}
+
 #[derive(Debug, Default, Serialize, Deserialize, Clone)]
 pub struct LocalConfig {
     #[serde(default, deserialize_with = "deserialize_string")]
@@ -2143,6 +2222,16 @@ pub struct LocalConfig {
     // Various data for flutter ui
     #[serde(default, deserialize_with = "deserialize_hashmap_string_string")]
     ui_flutter: HashMap<String, String>,
+    /// 0 means favorites/groups have not yet been migrated from the legacy
+    /// endpoint-keyed `fav` list and the Flutter `ui_flutter` JSON blob.
+    #[serde(default)]
+    schema_version: u32,
+    /// Canonical, fingerprint-keyed favorites. Order is preserved and is the
+    /// source of truth; `fav` is derived from this after migration.
+    #[serde(default)]
+    favorites: Vec<FavoriteDevice>,
+    #[serde(default)]
+    favorite_groups: Vec<FavoriteGroup>,
 }
 
 impl LocalConfig {
@@ -2231,11 +2320,420 @@ impl LocalConfig {
     }
 
     fn load() -> LocalConfig {
-        Config::load_::<LocalConfig>("_local")
+        let mut config = Config::load_::<LocalConfig>("_local");
+        if config.migrate_legacy_favorites_if_needed() {
+            // Best-effort: persist the migration immediately so a second
+            // process started right after doesn't re-derive it independently.
+            // If this fails (e.g. file lock contention), the in-memory
+            // migrated state is still used for this process, and the next
+            // successful checked write will persist it.
+            if let Err(err) = config.store_checked() {
+                log::error!("Failed to persist favorite migration: {err}");
+            }
+        }
+        config
     }
 
     fn store(&self) {
         Config::store_(self, "_local");
+    }
+
+    /// Writes this config to a temporary file and atomically renames it into
+    /// place, returning an error instead of silently swallowing it. Does not
+    /// take the cross-process lock itself; callers that need a checked
+    /// read-modify-write cycle should go through [`Self::with_favorites_locked`].
+    fn store_checked(&self) -> Result<()> {
+        let file = Config::file_("_local");
+        let tmp = file.with_extension("local.tmp");
+        store_path(tmp.clone(), self)?;
+        fs::rename(&tmp, &file)?;
+        Ok(())
+    }
+
+    /// Reloads from disk, distinguishing "file missing" (fine, use defaults)
+    /// from "file present but unparseable" (never silently discard user data
+    /// by falling back to defaults; preserve the bad file plus a recovery
+    /// copy and surface the error to the caller instead).
+    fn load_checked() -> Result<LocalConfig> {
+        let file = Config::file_("_local");
+        let loaded: std::result::Result<LocalConfig, confy::ConfyError> = confy::load_path(&file);
+        match loaded {
+            Ok(config) => Ok(config),
+            Err(err) => {
+                if let confy::ConfyError::GeneralLoadError(io_err) = &err {
+                    if io_err.kind() == std::io::ErrorKind::NotFound {
+                        return Ok(LocalConfig::default());
+                    }
+                }
+                let recovery = file.with_extension("local.corrupt");
+                if let Err(copy_err) = fs::copy(&file, &recovery) {
+                    log::error!(
+                        "Failed to preserve a recovery copy of the corrupt LocalConfig at {}: {}",
+                        recovery.display(),
+                        copy_err
+                    );
+                } else {
+                    log::error!(
+                        "LocalConfig at {} is corrupt; preserved a recovery copy at {}",
+                        file.display(),
+                        recovery.display()
+                    );
+                }
+                Err(anyhow!("LocalConfig is corrupt: {err}"))
+            }
+        }
+    }
+
+    fn lock_path() -> PathBuf {
+        Config::file_("_local").with_extension("local.lock")
+    }
+
+    /// Runs `mutate` against a freshly reloaded, checked copy of the config
+    /// while holding the cross-process lock, then atomically persists the
+    /// result and refreshes the in-process cache. This is the only path
+    /// favorite/group mutations should use: it replaces the old pattern of a
+    /// separate unlocked read followed by an unlocked write, which could
+    /// silently clobber a concurrent edit from another process.
+    fn with_favorites_locked<R>(
+        mutate: impl FnOnce(&mut LocalConfig) -> R,
+    ) -> Result<R> {
+        let _lock = CrossProcessLock::acquire(Self::lock_path(), Duration::from_secs(5))?;
+        let mut fresh = Self::load_checked()?;
+        fresh.migrate_legacy_favorites_if_needed();
+        let result = mutate(&mut fresh);
+        // Keep the legacy Flutter group blob in sync so old, not-yet-migrated
+        // Dart UI observes canonical changes made from the Rust side too.
+        let projection = fresh.project_legacy_group_json();
+        fresh
+            .ui_flutter
+            .insert(FAVORITE_PEER_GROUPS_OPTION_KEY.to_owned(), projection);
+        fresh.store_checked()?;
+        *LOCAL_CONFIG.write().unwrap() = fresh;
+        Ok(result)
+    }
+
+    /// Migrates the legacy endpoint-keyed `fav` list into canonical,
+    /// fingerprint-keyed `favorites` the first time this runs (`schema_version
+    /// == 0`). A legacy favorite endpoint is matched to a fingerprint only
+    /// when **exactly one** verified recent-connection record has that
+    /// endpoint; ambiguous or unmatched endpoints are kept as manageable
+    /// legacy entries with an empty fingerprint rather than guessed at.
+    /// Returns whether anything changed (so the caller knows to persist).
+    fn migrate_legacy_favorites_if_needed(&mut self) -> bool {
+        if self.schema_version != 0 {
+            return false;
+        }
+        self.schema_version = 1;
+        if self.favorites.is_empty() {
+            let legacy_groups = self.parse_legacy_group_json();
+            for endpoint in &self.fav {
+                let matches: Vec<&RecentLanEndpoint> = self
+                    .recent_lan_endpoints
+                    .values()
+                    .filter(|recent| &recent.endpoint == endpoint)
+                    .collect();
+                let fingerprint = if matches.len() == 1 {
+                    matches[0].fingerprint.clone()
+                } else {
+                    String::new()
+                };
+                let group_id = legacy_groups
+                    .as_ref()
+                    .and_then(|(_, peer_groups)| peer_groups.get(endpoint).cloned())
+                    .unwrap_or_default();
+                self.favorites.push(FavoriteDevice {
+                    fingerprint,
+                    endpoint: endpoint.clone(),
+                    group_id,
+                });
+            }
+            if let Some((groups, _)) = legacy_groups {
+                self.favorite_groups = groups;
+            }
+        }
+        self.sync_legacy_fav_projection();
+        true
+    }
+
+    /// Rebuilds the legacy `fav: Vec<String>` endpoint list from canonical
+    /// `favorites`, preserving order, for old readers during rollout.
+    fn sync_legacy_fav_projection(&mut self) {
+        self.fav = self
+            .favorites
+            .iter()
+            .map(|favorite| favorite.endpoint.clone())
+            .collect();
+    }
+
+    /// Parses the legacy Flutter group JSON blob (if present) into
+    /// `(groups, peer_id -> group_id)`.
+    fn parse_legacy_group_json(&self) -> Option<(Vec<FavoriteGroup>, HashMap<String, String>)> {
+        let raw = self.ui_flutter.get(FAVORITE_PEER_GROUPS_OPTION_KEY)?;
+        let value: serde_json::Value = serde_json::from_str(raw).ok()?;
+        let groups = value
+            .get("groups")?
+            .as_array()?
+            .iter()
+            .filter_map(|group| {
+                Some(FavoriteGroup {
+                    id: group.get("id")?.as_str()?.to_owned(),
+                    name: group.get("name")?.as_str()?.to_owned(),
+                })
+            })
+            .collect();
+        let peer_groups = value
+            .get("peer_groups")
+            .and_then(|value| value.as_object())
+            .map(|map| {
+                map.iter()
+                    .filter_map(|(peer_id, group_id)| {
+                        Some((peer_id.clone(), group_id.as_str()?.to_owned()))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        Some((groups, peer_groups))
+    }
+
+    /// Serializes canonical `favorite_groups`/`favorites` back into the
+    /// legacy Flutter JSON shape so old Dart code keeps working against
+    /// `ui_flutter["favorite-peer-groups"]` while Rust-side canonical
+    /// mutations are the source of truth.
+    fn project_legacy_group_json(&self) -> String {
+        let peer_groups: HashMap<&str, &str> = self
+            .favorites
+            .iter()
+            .filter(|favorite| !favorite.group_id.is_empty())
+            .map(|favorite| (favorite.endpoint.as_str(), favorite.group_id.as_str()))
+            .collect();
+        serde_json::json!({
+            "version": 1,
+            "groups": self.favorite_groups,
+            "peer_groups": peer_groups,
+        })
+        .to_string()
+    }
+
+    /// Applies a legacy Flutter group JSON write (from `set_flutter_option`)
+    /// into canonical state, so an edit made by not-yet-migrated Dart UI is
+    /// not lost when a Rust-side canonical reader looks at `favorites`/
+    /// `favorite_groups` instead of `ui_flutter`.
+    fn sync_canonical_groups_from_legacy_json(raw: &str) -> Result<()> {
+        let value: serde_json::Value =
+            serde_json::from_str(raw).map_err(|err| anyhow!("Invalid favorite group JSON: {err}"))?;
+        let groups: Vec<FavoriteGroup> = value
+            .get("groups")
+            .and_then(|value| value.as_array())
+            .map(|array| {
+                array
+                    .iter()
+                    .filter_map(|group| {
+                        Some(FavoriteGroup {
+                            id: group.get("id")?.as_str()?.to_owned(),
+                            name: group.get("name")?.as_str()?.to_owned(),
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let peer_groups: HashMap<String, String> = value
+            .get("peer_groups")
+            .and_then(|value| value.as_object())
+            .map(|map| {
+                map.iter()
+                    .filter_map(|(peer_id, group_id)| {
+                        Some((peer_id.clone(), group_id.as_str()?.to_owned()))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        Self::with_favorites_locked(|config| {
+            config.favorite_groups = groups;
+            for favorite in config.favorites.iter_mut() {
+                favorite.group_id = peer_groups.get(&favorite.endpoint).cloned().unwrap_or_default();
+            }
+        })
+    }
+
+    pub fn get_favorites() -> Vec<FavoriteDevice> {
+        LOCAL_CONFIG.read().unwrap().favorites.clone()
+    }
+
+    /// Loads canonical favorite fingerprints directly from disk, keyed by
+    /// endpoint, so another desktop process (e.g. the tray, which has its own
+    /// static config cache) can resolve which saved favorite endpoint
+    /// corresponds to a verified device fingerprint without going through
+    /// the in-process cache.
+    pub fn load_favorite_fingerprints() -> HashMap<String, String> {
+        Self::load()
+            .favorites
+            .into_iter()
+            .filter(|favorite| !favorite.fingerprint.is_empty())
+            .map(|favorite| (favorite.endpoint, favorite.fingerprint))
+            .collect()
+    }
+
+    pub fn get_favorite_groups() -> Vec<FavoriteGroup> {
+        LOCAL_CONFIG.read().unwrap().favorite_groups.clone()
+    }
+
+    /// Adds a favorite, or updates its endpoint/group if a favorite with this
+    /// fingerprint already exists. `fingerprint` must be a verified device
+    /// identity, not a bare endpoint guess.
+    pub fn add_or_update_favorite(
+        fingerprint: &str,
+        endpoint: &str,
+        group_id: Option<&str>,
+    ) -> Result<()> {
+        if fingerprint.len() != 64 || !fingerprint.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(anyhow!("Invalid device fingerprint"));
+        }
+        let fingerprint = fingerprint.to_ascii_lowercase();
+        let endpoint = crate::lan::Endpoint::parse(endpoint)?
+            .authority()
+            .to_owned();
+        Self::with_favorites_locked(|config| {
+            config.upsert_favorite_entry(&fingerprint, &endpoint, group_id)
+        })
+    }
+
+    fn upsert_favorite_entry(&mut self, fingerprint: &str, endpoint: &str, group_id: Option<&str>) {
+        if let Some(existing) = self
+            .favorites
+            .iter_mut()
+            .find(|favorite| favorite.fingerprint == fingerprint)
+        {
+            existing.endpoint = endpoint.to_owned();
+            if let Some(group_id) = group_id {
+                existing.group_id = group_id.to_owned();
+            }
+        } else {
+            self.favorites.push(FavoriteDevice {
+                fingerprint: fingerprint.to_owned(),
+                endpoint: endpoint.to_owned(),
+                group_id: group_id.unwrap_or_default().to_owned(),
+            });
+        }
+        self.sync_legacy_fav_projection();
+    }
+
+    pub fn remove_favorite_by_fingerprint(fingerprint: &str) -> Result<()> {
+        let fingerprint = fingerprint.to_ascii_lowercase();
+        Self::with_favorites_locked(|config| config.remove_favorite_entry(&fingerprint))
+    }
+
+    fn remove_favorite_entry(&mut self, fingerprint: &str) {
+        self.favorites
+            .retain(|favorite| favorite.fingerprint != fingerprint);
+        self.sync_legacy_fav_projection();
+    }
+
+    /// Reorders favorites to match `order` (a list of fingerprints). Entries
+    /// not named in `order` keep their relative order and are appended after
+    /// the named ones, so an unknown/legacy entry is never dropped.
+    pub fn reorder_favorites(order: Vec<String>) -> Result<()> {
+        Self::with_favorites_locked(|config| config.reorder_favorites_entries(&order))
+    }
+
+    fn reorder_favorites_entries(&mut self, order: &[String]) {
+        let mut reordered = Vec::with_capacity(self.favorites.len());
+        for fingerprint in order {
+            if let Some(pos) = self
+                .favorites
+                .iter()
+                .position(|favorite| &favorite.fingerprint == fingerprint)
+            {
+                reordered.push(self.favorites.remove(pos));
+            }
+        }
+        reordered.append(&mut self.favorites);
+        self.favorites = reordered;
+        self.sync_legacy_fav_projection();
+    }
+
+    /// Atomically updates the endpoint of any existing favorite(s) matching
+    /// `fingerprint`. Does nothing if the device is not currently a favorite,
+    /// and never creates a new favorite — this replaces the old non-atomic
+    /// `get_fav`/`set_fav` endpoint-string rewrite used after a verified LAN
+    /// reconnection at a new address.
+    pub fn update_favorite_endpoint_for_fingerprint(
+        fingerprint: &str,
+        new_endpoint: &str,
+    ) -> Result<bool> {
+        let fingerprint = fingerprint.to_ascii_lowercase();
+        let new_endpoint = crate::lan::Endpoint::parse(new_endpoint)?
+            .authority()
+            .to_owned();
+        Self::with_favorites_locked(|config| {
+            config.update_favorite_endpoint_entry(&fingerprint, &new_endpoint)
+        })
+    }
+
+    fn update_favorite_endpoint_entry(&mut self, fingerprint: &str, new_endpoint: &str) -> bool {
+        let mut changed = false;
+        for favorite in self
+            .favorites
+            .iter_mut()
+            .filter(|favorite| favorite.fingerprint == fingerprint)
+        {
+            if favorite.endpoint != new_endpoint {
+                favorite.endpoint = new_endpoint.to_owned();
+                changed = true;
+            }
+        }
+        if changed {
+            self.sync_legacy_fav_projection();
+        }
+        changed
+    }
+
+    pub fn add_favorite_group(name: &str) -> Result<FavoriteGroup> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(anyhow!("Group name must not be empty"));
+        }
+        let group = FavoriteGroup {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: name.to_owned(),
+        };
+        let group_clone = group.clone();
+        Self::with_favorites_locked(|config| {
+            config.favorite_groups.push(group_clone);
+        })?;
+        Ok(group)
+    }
+
+    pub fn rename_favorite_group(group_id: &str, name: &str) -> Result<()> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(anyhow!("Group name must not be empty"));
+        }
+        Self::with_favorites_locked(|config| config.rename_favorite_group_entry(group_id, name))
+    }
+
+    fn rename_favorite_group_entry(&mut self, group_id: &str, name: &str) {
+        if let Some(group) = self
+            .favorite_groups
+            .iter_mut()
+            .find(|group| group.id == group_id)
+        {
+            group.name = name.to_owned();
+        }
+    }
+
+    /// Removes a group and clears it from any favorite that referenced it;
+    /// the favorites themselves are kept (ungrouped), never deleted.
+    pub fn remove_favorite_group(group_id: &str) -> Result<()> {
+        Self::with_favorites_locked(|config| config.remove_favorite_group_entry(group_id))
+    }
+
+    fn remove_favorite_group_entry(&mut self, group_id: &str) {
+        self.favorite_groups.retain(|group| group.id != group_id);
+        for favorite in self.favorites.iter_mut() {
+            if favorite.group_id == group_id {
+                favorite.group_id.clear();
+            }
+        }
     }
 
     pub fn get_kb_layout_type() -> String {
@@ -2487,6 +2985,16 @@ impl LocalConfig {
     }
 
     pub fn set_flutter_option(k: String, v: String) {
+        // The Flutter UI still owns this key directly (it hasn't been
+        // migrated to the canonical favorite/group bridge calls yet), but
+        // mirror its write into canonical state under the cross-process lock
+        // so a Rust-side reader (and a verified-connection endpoint update)
+        // sees the same data instead of two diverging sources of truth.
+        if k == FAVORITE_PEER_GROUPS_OPTION_KEY && !v.is_empty() {
+            if let Err(err) = Self::sync_canonical_groups_from_legacy_json(&v) {
+                log::error!("Failed to sync canonical favorite groups from Flutter: {err}");
+            }
+        }
         let mut config = LOCAL_CONFIG.write().unwrap();
         let v2 = if v.is_empty() { None } else { Some(&v) };
         if v2 != config.ui_flutter.get(&k) {
@@ -2498,6 +3006,26 @@ impl LocalConfig {
             config.store();
         }
     }
+}
+
+/// A discovery observation is treated as stale (no longer "Online") after
+/// this long without a fresh one.
+const DISCOVERY_ONLINE_WINDOW_MS: i64 = 45_000;
+/// A peer is only marked Offline after at least this many consecutive
+/// full-coverage scans found no observation of it.
+const DISCOVERY_OFFLINE_MIN_MISSES: u32 = 2;
+/// ...and only once those misses span at least this long, so a single fast
+/// re-scan right after the first miss can't flip a device Offline.
+const DISCOVERY_OFFLINE_MIN_MISS_SPAN_MS: i64 = 15_000;
+
+/// Discovery-derived reachability. This reflects only what LAN broadcast/mDNS
+/// observation has shown; it does not know about an active verified
+/// connection (callers that track one should treat that as Online directly).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LanReachability {
+    Online,
+    Unknown,
+    Offline,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize, Clone)]
@@ -2516,7 +3044,25 @@ pub struct DiscoveryPeer {
     pub endpoint: String,
     #[serde(default, deserialize_with = "deserialize_string")]
     pub fingerprint: String,
+    /// Milliseconds since epoch of the last successful discovery observation
+    /// (UDP pong or resolved mDNS record) of this device, 0 if never seen.
+    #[serde(default, deserialize_with = "deserialize_i64")]
+    pub last_seen_at: i64,
+    /// Completion time (ms since epoch) of the last full-coverage scan that
+    /// counted toward `consecutive_full_misses` for this peer.
+    #[serde(default, deserialize_with = "deserialize_i64")]
+    pub last_full_scan_at: i64,
+    /// Completion time (ms since epoch) of the first full-coverage scan in
+    /// the current unbroken run of misses; 0 while there is no active miss
+    /// streak. Reset to 0 by any positive observation.
+    #[serde(default, deserialize_with = "deserialize_i64")]
+    pub first_miss_at: i64,
+    /// Consecutive full-coverage scans that found no observation of this
+    /// device. Reset to 0 by any positive observation.
+    #[serde(default, deserialize_with = "deserialize_u32")]
+    pub consecutive_full_misses: u32,
     // TOML tables must follow scalar values when serialized by toml 0.5.
+    // Legacy, unauthenticated historical addresses; retained for old readers.
     #[serde(default, deserialize_with = "deserialize_hashmap_string_string")]
     pub ip_mac: HashMap<String, String>,
 }
@@ -2529,10 +3075,57 @@ impl DiscoveryPeer {
             self.id == other.id && self.username == other.username
         }
     }
+
+    /// A fresh positive observation: bump `last_seen_at` (never backwards)
+    /// and clear any miss streak. Applies regardless of scan generation —
+    /// an observation from an older, still-in-flight scan is still real
+    /// evidence the device was reachable at that time.
+    fn record_observation(&mut self, observed_at_ms: i64) {
+        if observed_at_ms > self.last_seen_at {
+            self.last_seen_at = observed_at_ms;
+        }
+        self.first_miss_at = 0;
+        self.consecutive_full_misses = 0;
+        self.online = self.reachability(observed_at_ms) == LanReachability::Online;
+    }
+
+    /// Records that a newest-generation, full-coverage scan completed at
+    /// `scan_completed_at_ms` without observing this device. Callers must
+    /// only call this for the newest completed full-coverage scan generation
+    /// (see [`LanPeers::merge_scan`]); an older or limited-coverage scan must
+    /// never call this.
+    fn record_full_scan_miss(&mut self, scan_completed_at_ms: i64) {
+        if self.first_miss_at == 0 {
+            self.first_miss_at = scan_completed_at_ms;
+        }
+        self.last_full_scan_at = scan_completed_at_ms;
+        self.consecutive_full_misses = self.consecutive_full_misses.saturating_add(1);
+        self.online = self.reachability(scan_completed_at_ms) == LanReachability::Online;
+    }
+
+    pub fn reachability(&self, now_ms: i64) -> LanReachability {
+        if self.last_seen_at > 0 && now_ms - self.last_seen_at <= DISCOVERY_ONLINE_WINDOW_MS {
+            return LanReachability::Online;
+        }
+        if self.first_miss_at > 0
+            && self.consecutive_full_misses >= DISCOVERY_OFFLINE_MIN_MISSES
+            && self.last_full_scan_at - self.first_miss_at >= DISCOVERY_OFFLINE_MIN_MISS_SPAN_MS
+        {
+            return LanReachability::Offline;
+        }
+        LanReachability::Unknown
+    }
 }
 
 #[derive(Debug, Default, Serialize, Deserialize, Clone)]
 pub struct LanPeers {
+    /// The generation of the newest completed full-coverage scan that has
+    /// already been allowed to apply negative evidence (misses) or change
+    /// preferred endpoints. A scan with a generation at or below this value
+    /// must not repeat that; it may still add positive observations.
+    #[serde(default, deserialize_with = "deserialize_u64")]
+    pub last_applied_negative_generation: u64,
+    // TOML tables must follow scalar values when serialized by toml 0.5.
     #[serde(default, deserialize_with = "deserialize_vec_discoverypeer")]
     pub peers: Vec<DiscoveryPeer>,
 }
@@ -2550,8 +3143,10 @@ impl LanPeers {
     }
 
     pub fn store(peers: &[DiscoveryPeer]) {
+        let existing = Self::load();
         let f = LanPeers {
             peers: peers.to_owned(),
+            last_applied_negative_generation: existing.last_applied_negative_generation,
         };
         if let Err(err) = store_path(Config::file_("_lan_peers"), f) {
             log::error!("Failed to store lan peers: {}", err);
@@ -2564,6 +3159,81 @@ impl LanPeers {
             .modified()?
             .duration_since(SystemTime::UNIX_EPOCH)?
             .as_millis() as _)
+    }
+
+    fn lock_path() -> PathBuf {
+        Config::file_("_lan_peers").with_extension("lan_peers.lock")
+    }
+
+    /// Merges this scan's observed peers into the cross-process-shared
+    /// `_lan_peers` cache under the lock, applying the generation rules so
+    /// an older or limited-coverage scan can only add positive observations
+    /// — never negative evidence, preferred-endpoint changes, or an Offline
+    /// transition — while the newest completed full-coverage scan may do
+    /// all of that. Returns the merged, reconciled peer list.
+    pub fn merge_scan(
+        scan_generation: u64,
+        full_coverage: bool,
+        observed: Vec<DiscoveryPeer>,
+        now_ms: i64,
+    ) -> crate::ResultType<Vec<DiscoveryPeer>> {
+        let _guard = CrossProcessLock::acquire(Self::lock_path(), Duration::from_secs(5))?;
+        let mut current: LanPeers = match confy::load_path(Config::file_("_lan_peers")) {
+            Ok(value) => value,
+            Err(err) => {
+                log::error!("Failed to load lan peers for merge: {err}");
+                Default::default()
+            }
+        };
+
+        let apply_negative =
+            full_coverage && scan_generation > current.last_applied_negative_generation;
+
+        fn peer_key(peer: &DiscoveryPeer) -> String {
+            if !peer.fingerprint.is_empty() {
+                peer.fingerprint.to_ascii_lowercase()
+            } else {
+                format!("{}|{}", peer.id, peer.username)
+            }
+        }
+
+        let mut observed_keys = HashSet::new();
+        for mut peer in observed {
+            observed_keys.insert(peer_key(&peer));
+            if let Some(pos) = current.peers.iter().position(|x| x.is_same_peer(&peer)) {
+                let mut existing = current.peers.remove(pos);
+                // Carry forward historical candidate data the new
+                // observation doesn't itself carry (e.g. prior ip_mac
+                // entries), then apply the fresh positive observation.
+                let mut merged_ip_mac = std::mem::take(&mut existing.ip_mac);
+                merged_ip_mac.extend(peer.ip_mac);
+                existing.ip_mac = merged_ip_mac;
+                existing.hostname = peer.hostname;
+                existing.platform = peer.platform;
+                existing.username = peer.username;
+                existing.endpoint = peer.endpoint;
+                existing.id = peer.id;
+                existing.record_observation(now_ms);
+                current.peers.insert(0, existing);
+            } else {
+                peer.record_observation(now_ms);
+                current.peers.insert(0, peer);
+            }
+        }
+
+        if apply_negative {
+            for peer in current.peers.iter_mut() {
+                if !observed_keys.contains(&peer_key(peer)) {
+                    peer.record_full_scan_miss(now_ms);
+                }
+            }
+            current.last_applied_negative_generation = scan_generation;
+        }
+
+        if let Err(err) = store_path(Config::file_("_lan_peers"), current.clone()) {
+            return Err(anyhow!("Failed to persist merged lan peers: {err}"));
+        }
+        Ok(current.peers)
     }
 }
 
@@ -3808,6 +4478,123 @@ mod tests {
         assert_eq!(decoded.lan_identities, config.lan_identities);
     }
 
+    #[test]
+    fn migration_assigns_fingerprint_only_for_unambiguous_verified_recent_endpoint() {
+        let fingerprint = "a".repeat(64);
+        let mut config = LocalConfig::default();
+        config.fav = vec![
+            "192.168.1.20:21118".to_owned(),
+            "192.168.1.99:21118".to_owned(),
+        ];
+        config.upsert_recent_lan_endpoint(RecentLanEndpoint {
+            endpoint: "192.168.1.20:21118".to_owned(),
+            fingerprint: fingerprint.clone(),
+            last_connected_at: 1,
+            ..Default::default()
+        });
+        // Two different fingerprints both recently seen at the same endpoint:
+        // migration must not guess, and must leave this entry unmatched.
+        config.upsert_recent_lan_endpoint(RecentLanEndpoint {
+            endpoint: "192.168.1.99:21118".to_owned(),
+            fingerprint: "b".repeat(64),
+            last_connected_at: 2,
+            ..Default::default()
+        });
+        config.upsert_recent_lan_endpoint(RecentLanEndpoint {
+            endpoint: "192.168.1.99:21118".to_owned(),
+            fingerprint: "c".repeat(64),
+            last_connected_at: 3,
+            ..Default::default()
+        });
+
+        assert!(config.migrate_legacy_favorites_if_needed());
+        assert_eq!(config.schema_version, 1);
+        assert_eq!(config.favorites.len(), 2);
+        assert_eq!(config.favorites[0].endpoint, "192.168.1.20:21118");
+        assert_eq!(config.favorites[0].fingerprint, fingerprint);
+        assert_eq!(config.favorites[1].endpoint, "192.168.1.99:21118");
+        assert!(
+            config.favorites[1].fingerprint.is_empty(),
+            "ambiguous endpoint must not be auto-assigned a fingerprint"
+        );
+        // Legacy projection round-trips the same order.
+        assert_eq!(config.fav, vec![
+            "192.168.1.20:21118".to_owned(),
+            "192.168.1.99:21118".to_owned(),
+        ]);
+        // Migration only runs once.
+        assert!(!config.migrate_legacy_favorites_if_needed());
+    }
+
+    #[test]
+    fn favorite_entry_mutations_stay_fingerprint_keyed_and_project_to_legacy_list() {
+        let fingerprint_a = "a".repeat(64);
+        let fingerprint_b = "b".repeat(64);
+        let mut config = LocalConfig::default();
+        config.upsert_favorite_entry(&fingerprint_a, "10.0.0.5:21118", None);
+        config.upsert_favorite_entry(&fingerprint_b, "10.0.0.6:21118", Some("group-1"));
+        assert_eq!(config.fav, vec![
+            "10.0.0.5:21118".to_owned(),
+            "10.0.0.6:21118".to_owned(),
+        ]);
+
+        // A mismatched device taking over the old IP must not silently merge
+        // into the existing favorite; it's a distinct fingerprint.
+        assert!(config.update_favorite_endpoint_entry(&fingerprint_a, "10.0.0.50:21118"));
+        assert_eq!(config.favorites[0].endpoint, "10.0.0.50:21118");
+        assert!(!config.update_favorite_endpoint_entry(&"c".repeat(64), "10.0.0.60:21118"));
+
+        config.reorder_favorites_entries(&[fingerprint_b.clone(), fingerprint_a.clone()]);
+        assert_eq!(config.favorites[0].fingerprint, fingerprint_b);
+        assert_eq!(config.favorites[1].fingerprint, fingerprint_a);
+
+        config.remove_favorite_entry(&fingerprint_b);
+        assert_eq!(config.favorites.len(), 1);
+        assert_eq!(config.fav, vec!["10.0.0.50:21118".to_owned()]);
+    }
+
+    #[test]
+    fn legacy_group_json_round_trips_through_canonical_state() {
+        let mut config = LocalConfig::default();
+        config.upsert_favorite_entry(&"a".repeat(64), "10.0.0.5:21118", None);
+        config.favorite_groups.push(FavoriteGroup {
+            id: "group-1".to_owned(),
+            name: "Workstations".to_owned(),
+        });
+        config.favorites[0].group_id = "group-1".to_owned();
+
+        let projected = config.project_legacy_group_json();
+        let mut restored = LocalConfig::default();
+        restored.upsert_favorite_entry(&"a".repeat(64), "10.0.0.5:21118", None);
+        restored
+            .ui_flutter
+            .insert(FAVORITE_PEER_GROUPS_OPTION_KEY.to_owned(), projected);
+        let (groups, peer_groups) = restored.parse_legacy_group_json().unwrap();
+        assert_eq!(groups, vec![FavoriteGroup {
+            id: "group-1".to_owned(),
+            name: "Workstations".to_owned(),
+        }]);
+        assert_eq!(
+            peer_groups.get("10.0.0.5:21118"),
+            Some(&"group-1".to_owned())
+        );
+    }
+
+    #[test]
+    fn removing_favorite_group_ungroups_members_but_keeps_favorites() {
+        let mut config = LocalConfig::default();
+        config.upsert_favorite_entry(&"a".repeat(64), "10.0.0.5:21118", Some("group-1"));
+        config.favorite_groups.push(FavoriteGroup {
+            id: "group-1".to_owned(),
+            name: "Workstations".to_owned(),
+        });
+
+        config.remove_favorite_group_entry("group-1");
+        assert!(config.favorite_groups.is_empty());
+        assert_eq!(config.favorites.len(), 1);
+        assert!(config.favorites[0].group_id.is_empty());
+    }
+
     struct ConfigStateTestGuard {
         original_config: Config,
         original_hard_settings: HashMap<String, String>,
@@ -4463,5 +5250,103 @@ mod tests {
         let non_service_root = Config::ipc_path_for_uid(ROOT_UID, "");
         let non_service_user = Config::ipc_path_for_uid(USER_UID, "");
         assert_ne!(non_service_root, non_service_user);
+    }
+
+    #[test]
+    fn discovery_peer_reachability_requires_two_spaced_full_scan_misses_to_go_offline() {
+        let mut peer = DiscoveryPeer {
+            fingerprint: "a".repeat(64),
+            ..Default::default()
+        };
+        assert_eq!(peer.reachability(0), LanReachability::Unknown);
+
+        peer.record_observation(1_000);
+        assert_eq!(peer.reachability(1_000), LanReachability::Online);
+        assert_eq!(peer.reachability(1_000 + DISCOVERY_ONLINE_WINDOW_MS), LanReachability::Online);
+        assert_eq!(
+            peer.reachability(1_000 + DISCOVERY_ONLINE_WINDOW_MS + 1),
+            LanReachability::Unknown
+        );
+
+        // One full-coverage miss: still Unknown, not Offline yet.
+        peer.record_full_scan_miss(60_000);
+        assert_eq!(peer.reachability(60_000), LanReachability::Unknown);
+
+        // A second miss too soon after the first (< 15s span) stays Unknown.
+        peer.record_full_scan_miss(65_000);
+        assert_eq!(peer.reachability(65_000), LanReachability::Unknown);
+
+        // A second miss at least 15s after the first qualifies as Offline.
+        peer.record_full_scan_miss(60_000 + DISCOVERY_OFFLINE_MIN_MISS_SPAN_MS);
+        assert_eq!(
+            peer.reachability(60_000 + DISCOVERY_OFFLINE_MIN_MISS_SPAN_MS),
+            LanReachability::Offline
+        );
+
+        // Any positive observation immediately clears the miss streak.
+        peer.record_observation(70_000);
+        assert_eq!(peer.reachability(70_000), LanReachability::Online);
+        assert_eq!(peer.consecutive_full_misses, 0);
+        assert_eq!(peer.first_miss_at, 0);
+    }
+
+    #[test]
+    fn lan_peers_merge_scan_generation_rules() {
+        let _guard = CONFIG_STATE_TEST_LOCK.lock().unwrap();
+        let _file_guard = ConfigFileRestoreGuard::new(Config::file_("_lan_peers"));
+        fs::remove_file(Config::file_("_lan_peers")).ok();
+        fs::remove_file(LanPeers::lock_path()).ok();
+
+        let fingerprint = "a".repeat(64);
+        let make_peer = |endpoint: &str| DiscoveryPeer {
+            id: endpoint.to_owned(),
+            endpoint: endpoint.to_owned(),
+            fingerprint: fingerprint.clone(),
+            ..Default::default()
+        };
+
+        // Generation 1: full-coverage scan observes the device.
+        let merged = LanPeers::merge_scan(1, true, vec![make_peer("192.168.1.10:21118")], 1_000)
+            .unwrap();
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].last_seen_at, 1_000);
+
+        // Generation 2 (newest), full coverage, no observation: this is the
+        // first qualifying miss.
+        let merged = LanPeers::merge_scan(2, true, vec![], 60_000).unwrap();
+        assert_eq!(merged[0].consecutive_full_misses, 1);
+        assert_eq!(merged[0].reachability(60_000), LanReachability::Unknown);
+
+        // An OLDER generation (1, already applied) reporting another miss
+        // must NOT be allowed to advance the miss streak or mark Offline,
+        // even though it's also "full coverage" on its own terms.
+        let merged = LanPeers::merge_scan(1, true, vec![], 60_000 + DISCOVERY_OFFLINE_MIN_MISS_SPAN_MS)
+            .unwrap();
+        assert_eq!(
+            merged[0].consecutive_full_misses, 1,
+            "an older generation must not apply negative evidence"
+        );
+
+        // The newest generation (3) completing a second full-coverage miss,
+        // spaced out enough, finally marks it Offline.
+        let now = 60_000 + DISCOVERY_OFFLINE_MIN_MISS_SPAN_MS;
+        let merged = LanPeers::merge_scan(3, true, vec![], now).unwrap();
+        assert_eq!(merged[0].consecutive_full_misses, 2);
+        assert_eq!(merged[0].reachability(now), LanReachability::Offline);
+
+        // A later, LIMITED-coverage scan must not clear the Offline miss
+        // streak just by not observing the device, but a positive
+        // observation in it still counts and resets the streak.
+        let merged = LanPeers::merge_scan(4, false, vec![], now + 1_000).unwrap();
+        assert_eq!(
+            merged[0].consecutive_full_misses, 2,
+            "a limited-coverage scan must not touch negative evidence"
+        );
+        let merged =
+            LanPeers::merge_scan(5, false, vec![make_peer("192.168.1.11:21118")], now + 2_000)
+                .unwrap();
+        assert_eq!(merged[0].consecutive_full_misses, 0);
+        assert_eq!(merged[0].endpoint, "192.168.1.11:21118");
+        assert_eq!(merged[0].reachability(now + 2_000), LanReachability::Online);
     }
 }
