@@ -2209,8 +2209,37 @@ pub struct LocalConfig {
     size: Size,
     #[serde(default, deserialize_with = "deserialize_vec_string")]
     pub fav: Vec<String>,
+    /// User-saved subnet/VLAN ranges (CIDR, dash range, or single IP) for the
+    /// manual LAN scan, so a routed subnet the user already knows about
+    /// doesn't need to be retyped on every scan.
+    #[serde(default, deserialize_with = "deserialize_vec_string")]
+    pub saved_subnets: Vec<String>,
     #[serde(default, deserialize_with = "deserialize_string")]
     default_lan_identity_id: String,
+    /// 0 means favorites/groups have not yet been migrated from the legacy
+    /// endpoint-keyed `fav` list and the Flutter `ui_flutter` JSON blob.
+    // TOML tables must follow scalar values when serialized by toml 0.5, so
+    // this scalar is declared before any of the table/array-of-tables fields
+    // below (favorites, favorite_groups, options, recent_lan_endpoints, ...).
+    #[serde(default)]
+    schema_version: u32,
+    /// Canonical, fingerprint-keyed favorites. Order is preserved and is the
+    /// source of truth; `fav` is derived from this after migration.
+    // toml 0.5 (used by `confy` for the on-disk format) additionally
+    // requires every array-of-tables field (`Vec<Struct>`, emitted as
+    // `[[field]]`) to be declared before any plain-table field (`HashMap`,
+    // emitted as `[field]`): a `HashMap` field emitted first marks the
+    // struct's table state as "table emitted", and toml 0.5 then rejects a
+    // later array-of-tables field with `ValueAfterTable` even though both
+    // are "table" category and the ordering is valid TOML. This silently
+    // broke every `_local.toml` save once `favorites`/`favorite_groups`
+    // were added after `options`/`recent_lan_endpoints`/etc., which is why
+    // LAN favorites and recent sessions appeared to vanish on relaunch:
+    // the write never actually reached disk.
+    #[serde(default)]
+    favorites: Vec<FavoriteDevice>,
+    #[serde(default)]
+    favorite_groups: Vec<FavoriteGroup>,
     #[serde(default, deserialize_with = "deserialize_hashmap_string_string")]
     options: HashMap<String, String>,
     #[serde(default)]
@@ -2222,16 +2251,6 @@ pub struct LocalConfig {
     // Various data for flutter ui
     #[serde(default, deserialize_with = "deserialize_hashmap_string_string")]
     ui_flutter: HashMap<String, String>,
-    /// 0 means favorites/groups have not yet been migrated from the legacy
-    /// endpoint-keyed `fav` list and the Flutter `ui_flutter` JSON blob.
-    #[serde(default)]
-    schema_version: u32,
-    /// Canonical, fingerprint-keyed favorites. Order is preserved and is the
-    /// source of truth; `fav` is derived from this after migration.
-    #[serde(default)]
-    favorites: Vec<FavoriteDevice>,
-    #[serde(default)]
-    favorite_groups: Vec<FavoriteGroup>,
 }
 
 impl LocalConfig {
@@ -2420,39 +2439,66 @@ impl LocalConfig {
     /// legacy entries with an empty fingerprint rather than guessed at.
     /// Returns whether anything changed (so the caller knows to persist).
     fn migrate_legacy_favorites_if_needed(&mut self) -> bool {
-        if self.schema_version != 0 {
-            return false;
-        }
-        self.schema_version = 1;
-        if self.favorites.is_empty() {
-            let legacy_groups = self.parse_legacy_group_json();
-            for endpoint in &self.fav {
-                let matches: Vec<&RecentLanEndpoint> = self
-                    .recent_lan_endpoints
-                    .values()
-                    .filter(|recent| &recent.endpoint == endpoint)
-                    .collect();
-                let fingerprint = if matches.len() == 1 {
-                    matches[0].fingerprint.clone()
-                } else {
-                    String::new()
-                };
-                let group_id = legacy_groups
-                    .as_ref()
-                    .and_then(|(_, peer_groups)| peer_groups.get(endpoint).cloned())
-                    .unwrap_or_default();
-                self.favorites.push(FavoriteDevice {
-                    fingerprint,
-                    endpoint: endpoint.clone(),
-                    group_id,
-                });
-            }
-            if let Some((groups, _)) = legacy_groups {
+        let mut changed = false;
+        if self.schema_version == 0 {
+            self.schema_version = 1;
+            if let Some((groups, _)) = self.parse_legacy_group_json() {
                 self.favorite_groups = groups;
             }
+            changed = true;
         }
-        self.sync_legacy_fav_projection();
-        true
+        if self.reconcile_legacy_fav_entries() {
+            changed = true;
+        }
+        if changed {
+            self.sync_legacy_fav_projection();
+        }
+        changed
+    }
+
+    /// Absorbs any `fav` endpoint not yet represented in canonical
+    /// `favorites` into canonical form. Runs on every load, not only the
+    /// one-time schema migration above: the legacy Flutter UI still adds
+    /// favorites directly to the endpoint-keyed `fav` list (it hasn't been
+    /// switched to the canonical bridge calls yet), so without this, a
+    /// favorite added after the initial migration would never gain a
+    /// canonical, fingerprint-keyed record — and the atomic fingerprint-based
+    /// endpoint update that runs after a saved device reconnects at a new
+    /// address would have no canonical entry to find and update, silently
+    /// orphaning that favorite from the fingerprint-verification mechanism.
+    fn reconcile_legacy_fav_entries(&mut self) -> bool {
+        let legacy_groups = self.parse_legacy_group_json();
+        let mut added = false;
+        for endpoint in self.fav.clone() {
+            if self
+                .favorites
+                .iter()
+                .any(|favorite| favorite.endpoint == endpoint)
+            {
+                continue;
+            }
+            let matches: Vec<&RecentLanEndpoint> = self
+                .recent_lan_endpoints
+                .values()
+                .filter(|recent| recent.endpoint == endpoint)
+                .collect();
+            let fingerprint = if matches.len() == 1 {
+                matches[0].fingerprint.clone()
+            } else {
+                String::new()
+            };
+            let group_id = legacy_groups
+                .as_ref()
+                .and_then(|(_, peer_groups)| peer_groups.get(&endpoint).cloned())
+                .unwrap_or_default();
+            self.favorites.push(FavoriteDevice {
+                fingerprint,
+                endpoint,
+                group_id,
+            });
+            added = true;
+        }
+        added
     }
 
     /// Rebuilds the legacy `fav: Vec<String>` endpoint list from canonical
@@ -2912,6 +2958,35 @@ impl LocalConfig {
 
     pub fn get_fav() -> Vec<String> {
         LOCAL_CONFIG.read().unwrap().fav.clone()
+    }
+
+    pub fn get_saved_subnets() -> Vec<String> {
+        LOCAL_CONFIG.read().unwrap().saved_subnets.clone()
+    }
+
+    /// Adds `subnet` (trimmed) to the saved subnet list if not already
+    /// present, keeping the most recently added entry last. No-op for an
+    /// empty or already-saved value.
+    pub fn add_saved_subnet(subnet: &str) {
+        let subnet = subnet.trim();
+        if subnet.is_empty() {
+            return;
+        }
+        let mut lock = LOCAL_CONFIG.write().unwrap();
+        if lock.saved_subnets.iter().any(|value| value == subnet) {
+            return;
+        }
+        lock.saved_subnets.push(subnet.to_owned());
+        lock.store();
+    }
+
+    pub fn remove_saved_subnet(subnet: &str) {
+        let mut lock = LOCAL_CONFIG.write().unwrap();
+        let before = lock.saved_subnets.len();
+        lock.saved_subnets.retain(|value| value != subnet);
+        if lock.saved_subnets.len() != before {
+            lock.store();
+        }
     }
 
     /// Loads favorites and LAN peer metadata directly from disk so another
@@ -4479,6 +4554,49 @@ mod tests {
     }
 
     #[test]
+    fn local_config_round_trips_through_toml_with_favorites_and_groups_populated() {
+        // Regression test: a scalar field placed after a table/array-of-tables
+        // field makes toml 0.5 serialization fail at runtime (discovered live:
+        // `schema_version` was declared after `ui_flutter`, silently breaking
+        // every `_local` config save). Exercise the real `toml` crate, not
+        // just serde_json, since that's what `store_path`/`confy` actually use.
+        let mut config = LocalConfig::default();
+        config.schema_version = 1;
+        config.fav = vec!["192.168.1.5:21118".to_owned()];
+        config.saved_subnets = vec!["10.96.160.0/24".to_owned(), "10.96.39.1-254".to_owned()];
+        config.recent_lan_endpoints.insert(
+            "a".repeat(64),
+            RecentLanEndpoint {
+                endpoint: "192.168.1.5:21118".to_owned(),
+                fingerprint: "a".repeat(64),
+                ..Default::default()
+            },
+        );
+        config.favorites.push(FavoriteDevice {
+            fingerprint: "a".repeat(64),
+            endpoint: "192.168.1.5:21118".to_owned(),
+            group_id: "group-1".to_owned(),
+        });
+        config.favorite_groups.push(FavoriteGroup {
+            id: "group-1".to_owned(),
+            name: "Office".to_owned(),
+        });
+        config.ui_flutter.insert("some-ui-key".to_owned(), "value".to_owned());
+
+        let serialized =
+            toml::to_string(&config).expect("LocalConfig must serialize to TOML without error");
+        let decoded: LocalConfig =
+            toml::from_str(&serialized).expect("LocalConfig must round-trip through TOML");
+
+        assert_eq!(decoded.schema_version, 1);
+        assert_eq!(decoded.fav, config.fav);
+        assert_eq!(decoded.saved_subnets, config.saved_subnets);
+        assert_eq!(decoded.recent_lan_endpoints.len(), 1);
+        assert_eq!(decoded.favorites, config.favorites);
+        assert_eq!(decoded.favorite_groups, config.favorite_groups);
+    }
+
+    #[test]
     fn migration_assigns_fingerprint_only_for_unambiguous_verified_recent_endpoint() {
         let fingerprint = "a".repeat(64);
         let mut config = LocalConfig::default();
@@ -4524,6 +4642,174 @@ mod tests {
         ]);
         // Migration only runs once.
         assert!(!config.migrate_legacy_favorites_if_needed());
+    }
+
+    #[test]
+    fn legacy_favorite_added_after_initial_migration_is_still_reconciled() {
+        // Regression test for a live bug found via real-device testing: the
+        // Flutter UI still adds favorites directly to the legacy endpoint-
+        // keyed `fav` list (it hasn't been switched to canonical bridge
+        // calls). If that happens *after* the one-time schema migration has
+        // already run (the common case — a user favorites a device well
+        // after first installing the app), the new entry must still be
+        // picked up on the next load, or it can never gain a fingerprint and
+        // the atomic reconnect-at-new-endpoint update can never find it.
+        let fingerprint = "d".repeat(64);
+        let mut config = LocalConfig::default();
+        // Simulate migration having already run with nothing to migrate.
+        assert!(config.migrate_legacy_favorites_if_needed());
+        assert!(config.favorites.is_empty());
+
+        // Simulate a verified connection (populates recent_lan_endpoints)
+        // followed by the legacy UI adding it straight to `fav`.
+        config.upsert_recent_lan_endpoint(RecentLanEndpoint {
+            endpoint: "192.168.1.12:21118".to_owned(),
+            fingerprint: fingerprint.clone(),
+            last_connected_at: 1,
+            ..Default::default()
+        });
+        config.fav = vec!["192.168.1.12:21118".to_owned()];
+
+        assert!(config.migrate_legacy_favorites_if_needed());
+        assert_eq!(config.favorites.len(), 1);
+        assert_eq!(config.favorites[0].fingerprint, fingerprint);
+        assert_eq!(config.favorites[0].endpoint, "192.168.1.12:21118");
+
+        // The atomic fingerprint-based endpoint update (used after a saved
+        // device reconnects at a new address) must now be able to find it.
+        assert!(config.update_favorite_endpoint_entry(&fingerprint, "192.168.1.12:21218"));
+        assert_eq!(config.favorites[0].endpoint, "192.168.1.12:21218");
+        assert_eq!(config.fav, vec!["192.168.1.12:21218".to_owned()]);
+    }
+
+    /// Regression test for the actual root cause of a reported real-world
+    /// bug: LAN favorites and recent-session entries disappear after closing
+    /// and reopening the app, even on an unchanged, single-process,
+    /// non-elevated launch. The on-disk writer used by `LocalConfig::store`/
+    /// `store_checked` is `confy::store_path`, which serializes through the
+    /// `toml` 0.5 crate (pulled in transitively by the vendored `confy`
+    /// fork) -- a *different* TOML implementation than the `toml = "0.7"`
+    /// crate `hbb_common` depends on directly and uses in its own
+    /// `toml::to_string`-based round-trip tests. toml 0.5's serializer
+    /// additionally requires every array-of-tables field (`Vec<Struct>`,
+    /// emitted as `[[field]]`) to be declared *before* any plain-table field
+    /// (`HashMap`, emitted as `[field]`): once a `HashMap` field has been
+    /// emitted, the struct's internal "table emitted" flag is set, and a
+    /// later array-of-tables field is then rejected with `ValueAfterTable`
+    /// ("values must be emitted before tables") even though both are
+    /// "table" category and the ordering is valid TOML. `LocalConfig`
+    /// declared `favorites`/`favorite_groups` (`Vec<Struct>`) *after*
+    /// `options`/`recent_lan_endpoints`/`lan_identities`/
+    /// `lan_identity_bindings`/`ui_flutter` (all `HashMap`s), which is
+    /// exactly this broken combination: every single `_local.toml` save
+    /// failed, silently, because the plain `LocalConfig::store` /
+    /// `Config::store_` path only logs the error (`log::error!`) and
+    /// otherwise swallows it. This reproduces the failure directly against
+    /// `confy::store_path` (the exact function the production code calls),
+    /// not just `toml::to_string` (which the existing round-trip tests use
+    /// and which does not hit this bug), and proves the fix.
+    #[test]
+    fn local_config_persists_through_confy_store_path_with_favorites_and_recent_endpoints(
+    ) {
+        let mut config = LocalConfig::default();
+        config.fav = vec!["192.168.1.50:21118".to_owned()];
+        config.upsert_recent_lan_endpoint(RecentLanEndpoint {
+            endpoint: "192.168.1.50:21118".to_owned(),
+            fingerprint: "a".repeat(64),
+            last_connected_at: 1,
+            ..Default::default()
+        });
+        config.upsert_favorite_entry(&"a".repeat(64), "192.168.1.50:21118", None);
+        config.favorite_groups.push(FavoriteGroup {
+            id: "group-1".to_owned(),
+            name: "Office".to_owned(),
+        });
+
+        let temp_file = std::env::temp_dir().join(format!(
+            "subnetdesk_local_config_confy_test_{}.toml",
+            crate::get_time()
+        ));
+        let _ = fs::remove_file(&temp_file);
+
+        store_path(temp_file.clone(), &config)
+            .expect("confy::store_path must serialize LocalConfig without a TOML ordering error");
+        let reloaded: LocalConfig =
+            confy::load_path(&temp_file).expect("must read back what was just written");
+
+        assert_eq!(reloaded.fav, config.fav);
+        assert_eq!(reloaded.recent_lan_endpoints, config.recent_lan_endpoints);
+        assert_eq!(reloaded.favorites, config.favorites);
+        assert_eq!(reloaded.favorite_groups, config.favorite_groups);
+
+        let _ = fs::remove_file(&temp_file);
+    }
+
+    #[test]
+    fn stale_process_overwrite_clobbers_favorites_and_recent_endpoints() {
+        // Regression test for a second, independent contributor to the same
+        // reported bug once the TOML serialization failure above is fixed:
+        // `--server`, `--tray`, `--cm` and the GUI are all separate OS
+        // processes that each cache their own `LOCAL_CONFIG` snapshot once,
+        // at process start (see the `LOCAL_CONFIG` lazy_static above).
+        // `set_fav`/`record_recent_lan_endpoint`/`set_size`/etc. all persist
+        // through the plain, unlocked `LocalConfig::store`, which blindly
+        // serializes the *entire* in-memory struct to disk with no
+        // read-merge and no cross-process lock. If a second, longer-lived
+        // process cached its snapshot before a favorite was added elsewhere,
+        // the next unrelated local-config write from that stale process
+        // overwrites the whole file, silently erasing the favorite. Only the
+        // canonical `favorites`/`favorite_groups` mutations were hardened
+        // against this (see `with_favorites_locked`); the legacy `fav` list
+        // and `recent_lan_endpoints` were not.
+        let _guard = CONFIG_STATE_TEST_LOCK.lock().unwrap();
+        let original_app_name = APP_NAME.read().unwrap().clone();
+        *APP_NAME.write().unwrap() = format!("SubnetDeskClobberTest{}", crate::get_time());
+        let cleanup = || {
+            let _ = fs::remove_file(Config::file_("_local"));
+        };
+        cleanup();
+
+        // Process B (e.g. the background `--server`/`--tray`/`--cm` process)
+        // starts first and caches an empty snapshot.
+        let mut process_b = LocalConfig::load();
+
+        // Process A (the GUI) starts around the same time, also from an
+        // empty file, then the user adds a favorite and connects over LAN.
+        let mut process_a = LocalConfig::load();
+        process_a.fav = vec!["192.168.1.50:21118".to_owned()];
+        process_a.upsert_recent_lan_endpoint(RecentLanEndpoint {
+            endpoint: "192.168.1.50:21118".to_owned(),
+            fingerprint: "a".repeat(64),
+            last_connected_at: 1,
+            ..Default::default()
+        });
+        process_a.store();
+
+        // Sanity check: process A's write actually landed on disk.
+        let reloaded = LocalConfig::load();
+        assert_eq!(reloaded.fav, vec!["192.168.1.50:21118".to_owned()]);
+        assert_eq!(reloaded.recent_lan_endpoints.len(), 1);
+
+        // Process B later persists an unrelated local setting (e.g. its
+        // window size) through the same plain `store()` path, using the
+        // stale, favorite-less snapshot it cached at startup.
+        process_b.size = (0, 0, 800, 600);
+        process_b.store();
+
+        // The favorite and recent connection added by process A are gone,
+        // clobbered by process B's stale snapshot.
+        let after = LocalConfig::load();
+        assert!(
+            after.fav.is_empty() && after.recent_lan_endpoints.is_empty(),
+            "expected process B's unrelated write to clobber process A's \
+             favorite, demonstrating the cross-process persistence bug; got \
+             fav={:?} recent={:?}",
+            after.fav,
+            after.recent_lan_endpoints
+        );
+
+        cleanup();
+        *APP_NAME.write().unwrap() = original_app_name;
     }
 
     #[test]
