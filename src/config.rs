@@ -23,6 +23,7 @@ use sodiumoxide::base64;
 use sodiumoxide::crypto::sign;
 
 mod permanent_password;
+mod helper_profile;
 
 pub use permanent_password::{
     compute_permanent_password_h1, decode_permanent_password_h1_from_storage,
@@ -948,6 +949,12 @@ impl Config {
                 directories_next::ProjectDirs::from("", &org, &APP_NAME.read().unwrap())
             {
                 let mut path = patch(project.config_dir().to_path_buf());
+                #[cfg(windows)]
+                if let Some(id) = helper_profile::installed_profile() {
+                    if let Some(profile) = helper_profile::profile_path(path.clone(), &id) {
+                        path = profile;
+                    }
+                }
                 path.push(p);
                 return path;
             }
@@ -1381,6 +1388,10 @@ impl Config {
         res.extend(CONFIG2.read().unwrap().options.clone());
         res.extend(OVERWRITE_SETTINGS.read().unwrap().clone());
         res.retain(|key, _| !is_lan_only_obsolete_option(key));
+        #[cfg(windows)]
+        for key in ["incoming-only", "incoming-only-password", "incoming-only-initialized", "incoming-only-scope"] {
+            if let Some(value) = helper_profile::machine_option(key) { if value.is_empty() { res.remove(key); } else { res.insert(key.into(), value); } }
+        }
         res
     }
 
@@ -1401,6 +1412,8 @@ impl Config {
     }
 
     pub fn get_option(k: &str) -> String {
+        #[cfg(windows)]
+        if let Some(value) = helper_profile::machine_option(k) { return value; }
         if is_lan_only_obsolete_option(k) {
             return String::new();
         }
@@ -1416,6 +1429,8 @@ impl Config {
     /// Reads an option from persisted configuration instead of this process's
     /// startup-time snapshot. This is used by long-lived companion processes.
     pub fn get_option_from_file(k: &str) -> String {
+        #[cfg(windows)]
+        if let Some(value) = helper_profile::machine_option(k) { return value; }
         if is_lan_only_obsolete_option(k) {
             return String::new();
         }
@@ -3277,12 +3292,10 @@ impl LanPeers {
             observed_keys.insert(peer_key(&peer));
             if let Some(pos) = current.peers.iter().position(|x| x.is_same_peer(&peer)) {
                 let mut existing = current.peers.remove(pos);
-                // Carry forward historical candidate data the new
-                // observation doesn't itself carry (e.g. prior ip_mac
-                // entries), then apply the fresh positive observation.
-                let mut merged_ip_mac = std::mem::take(&mut existing.ip_mac);
-                merged_ip_mac.extend(peer.ip_mac);
-                existing.ip_mac = merged_ip_mac;
+                // Discovery addresses are observations, not verified history.
+                // Keep only addresses seen in this scan so a device moving to
+                // another network does not retain obsolete candidates.
+                existing.ip_mac = peer.ip_mac;
                 existing.hostname = peer.hostname;
                 existing.platform = peer.platform;
                 existing.username = peer.username;
@@ -3740,11 +3753,51 @@ fn is_option_can_save(
 
 #[inline]
 pub fn is_incoming_only() -> bool {
-    HARD_SETTINGS
+    if HARD_SETTINGS
         .read()
         .unwrap()
         .get("conn-type")
         .map_or(false, |x| x == ("incoming"))
+    {
+        return true;
+    }
+    #[cfg(windows)]
+    if Config::get_option("incoming-only-scope") == "device" { return Config::get_option("incoming-only") == "Y"; }
+    #[cfg(windows)]
+    if let Some(epoch) = helper_profile::install_epoch() {
+        // A process surviving MSI repair must not retain its old outgoing grant.
+        if CONFIG2.read().unwrap().options.get("receiver-install-id") != Some(&epoch) {
+            return true;
+        }
+    }
+    let state = Config::get_option("incoming-only-initialized");
+    if state == "locked" {
+        return true;
+    }
+    if !Config::get_option("incoming-only-password").is_empty() {
+        return true;
+    }
+    Config::get_option("incoming-only") == "Y"
+}
+
+/// Apply installation defaults once at startup, never while querying mode.
+pub fn initialize_receiver_only() {
+    let mut options = Config::get_options();
+    #[cfg(windows)]
+    if let Some(epoch) = helper_profile::install_epoch() {
+        helper_profile::apply_install_lock(&mut options, &epoch);
+    }
+    helper_profile::apply_default_lock(&mut options);
+    Config::set_options(options);
+}
+
+pub fn relock_managed_receiver_policy(policy: serde_json::Value) -> Result<serde_json::Value> {
+    helper_profile::relock_machine_policy(policy)
+}
+
+#[cfg(windows)]
+pub fn initialize_installed_helper() {
+    if helper_profile::installed_profile().is_some() { initialize_receiver_only(); }
 }
 
 #[inline]
@@ -5588,6 +5641,7 @@ mod tests {
             id: endpoint.to_owned(),
             endpoint: endpoint.to_owned(),
             fingerprint: fingerprint.clone(),
+            ip_mac: HashMap::from([(endpoint.split(':').next().unwrap().to_owned(), String::new())]),
             ..Default::default()
         };
 
@@ -5633,6 +5687,8 @@ mod tests {
                 .unwrap();
         assert_eq!(merged[0].consecutive_full_misses, 0);
         assert_eq!(merged[0].endpoint, "192.168.1.11:21118");
+        assert!(merged[0].ip_mac.contains_key("192.168.1.11"));
+        assert!(!merged[0].ip_mac.contains_key("192.168.1.10"));
         assert_eq!(merged[0].reachability(now + 2_000), LanReachability::Online);
     }
 }

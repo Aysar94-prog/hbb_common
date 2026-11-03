@@ -11,11 +11,44 @@ pub const ACCESS_CODE: u32 = 1;
 pub const ACCESS_MANUAL: u32 = 2;
 /// Requires a positive encrypted capability reply; never sent to legacy peers.
 pub const ACCESS_PASSWORD_ONLY: u32 = 3;
+pub const ACCESS_AUTO: u32 = 4;
 pub const NONCE_LEN: usize = 32;
 pub const MAX_ENDPOINT_LEN: usize = 512;
 pub const MAX_HOST_LEN: usize = 253;
 pub const MAX_USERNAME_LEN: usize = 64;
 pub const MAX_PASSWORD_LEN: usize = 256;
+
+/// AUTO accepts the same input as password authentication; only an empty input
+/// requests manual approval. Explicit code/manual methods remain restricted.
+pub fn validate_optional_access(method: u32, input: &str) -> Result<()> {
+    match method {
+        ACCESS_CODE if input.len() == 6 && input.bytes().all(|byte| byte.is_ascii_digit()) => Ok(()),
+        ACCESS_MANUAL if input.is_empty() => Ok(()),
+        ACCESS_AUTO if input.is_empty() => Ok(()),
+        ACCESS_AUTO => validate_password(input.as_bytes()),
+        _ => bail!("Invalid access method or temporary code"),
+    }
+}
+
+#[cfg(test)]
+mod optional_access_tests {
+    use super::*;
+    #[test]
+    fn auto_accepts_passwords_codes_and_manual_without_reclassifying() {
+        for input in ["abc", "long-password-!42", " كلمة سر ", "012345", "12345", "1234567", ""] {
+            assert!(validate_optional_access(ACCESS_AUTO, input).is_ok());
+        }
+    }
+    #[test]
+    fn malformed_auto_and_explicit_methods_are_rejected() {
+        for input in ["bad\npassword".to_owned(), "x".repeat(MAX_PASSWORD_LEN + 1)] {
+            assert!(validate_optional_access(ACCESS_AUTO, &input).is_err());
+        }
+        assert!(validate_optional_access(ACCESS_CODE, "abc").is_err());
+        assert!(validate_optional_access(ACCESS_MANUAL, "abc").is_err());
+        assert!(validate_optional_access(ACCESS_PASSWORD, "abc").is_err());
+    }
+}
 
 pub fn device_fingerprint(public_key: &[u8]) -> String {
     Sha256::digest(public_key)
